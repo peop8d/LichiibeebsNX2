@@ -12,7 +12,10 @@
 namespace Common::DkbFrameTrace {
 
 inline bool Enabled() {
-    static const bool enabled = [] {
+       #ifdef __ANDROID__
+           return true;
+       #endif
+        static const bool enabled = [] {
         const char* value = std::getenv("EDEN_DKB_FRAME_TRACE");
         return value && std::strcmp(value, "1") == 0;
     }();
