@@ -9,6 +9,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
+#include <algorithm>
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <string>
+#include <tuple>
+#include <vector>
 
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
@@ -2500,6 +2507,95 @@ static void Call64(Core::System& system, u32 imm, std::span<uint64_t, 8> args) {
     default: UNREACHABLE_MSG("Unhandled SVC {:#x}!", imm);
     }
 }
+namespace {
+// Android diagnostic: which guest threads block in which SVCs, and for how long. Every 10 s the
+// 25 largest (thread, svc, result) totals are logged; a game stuck behind a timeout shows up as
+// one thread waiting ~1 s per frame.
+bool WaitLogEnabled() {
+#ifdef __ANDROID__
+    return true;
+#else
+    static const bool enabled = std::getenv("EDEN_NX2_WAIT_LOG") != nullptr;
+    return enabled;
+#endif
+}
+
+bool IsWaitSvc(u32 imm) {
+    switch (imm) {
+    case 0x0B: // SleepThread
+    case 0x18: // WaitSynchronization
+    case 0x1A: // ArbitrateLock
+    case 0x1C: // WaitProcessWideKeyAtomic
+    case 0x21: // SendSyncRequest
+    case 0x22: // SendSyncRequestWithUserBuffer
+    case 0x34: // WaitForAddress
+        return true;
+    default:
+        return false;
+    }
+}
+
+struct WaitStat {
+    u64 count{};
+    u64 total_ns{};
+    u64 max_ns{};
+    std::string detail;
+};
+
+void RecordWait(Kernel::KernelCore& kernel, Kernel::KProcess& process, u64 thread_id, u32 imm,
+                const std::array<uint64_t, 8>& in_args, u32 result, u64 elapsed_ns) {
+    static std::mutex mutex;
+    static std::map<std::tuple<u64, u32, u32>, WaitStat> stats;
+    static auto window_start = std::chrono::steady_clock::now();
+    std::string detail;
+    if (elapsed_ns >= 20'000'000ULL) {
+        detail = fmt::format("a0={:#x} a1={:#x} a2={:#x} a3={:#x}", in_args[0], in_args[1],
+                             in_args[2], in_args[3]);
+        if (imm == 0x18) {
+            const s32 handle_count = static_cast<s32>(in_args[2]);
+            for (s32 i = 0; i < std::min(handle_count, 4); ++i) {
+                const u32 handle = process.GetMemory().Read32(in_args[1] + 4 * i);
+                Kernel::KScopedAutoObject event =
+                    process.GetHandleTable().GetObject<Kernel::KReadableEvent>(kernel, handle);
+                if (event.IsNotNull()) {
+                    detail += " " + Service::KernelHelpers::DebugEventName(event.GetPointerUnsafe());
+                }
+            }
+        }
+    }
+    std::scoped_lock lk{mutex};
+    auto& stat = stats[{thread_id, imm, result}];
+    ++stat.count;
+    stat.total_ns += elapsed_ns;
+    if (elapsed_ns > stat.max_ns) {
+        stat.max_ns = elapsed_ns;
+        if (!detail.empty()) {
+            stat.detail = std::move(detail);
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window_start < std::chrono::seconds{10}) {
+        return;
+    }
+    const double window_s = std::chrono::duration<double>(now - window_start).count();
+    std::vector<std::pair<std::tuple<u64, u32, u32>, WaitStat>> sorted(stats.begin(), stats.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second.total_ns > b.second.total_ns; });
+    LOG_INFO(Kernel_SVC, "WAITLOG {:.1f} s window, presents={}", window_s,
+             Core::g_nx2_present_count.load(std::memory_order_relaxed));
+    for (size_t i = 0; i < std::min<size_t>(sorted.size(), 25); ++i) {
+        const auto& [entry_key, entry] = sorted[i];
+        LOG_INFO(Kernel_SVC,
+                 "WAITLOG t{} svc {:#04x} res {:#x}: {} calls, {:.1f} ms/s, max {:.1f} ms {}",
+                 std::get<0>(entry_key), std::get<1>(entry_key), std::get<2>(entry_key),
+                 entry.count, static_cast<double>(entry.total_ns) / 1e6 / window_s,
+                 static_cast<double>(entry.max_ns) / 1e6, entry.detail);
+    }
+    stats.clear();
+    window_start = now;
+}
+} // namespace
+
 void Call(Core::System& system, u32 imm) {
     auto& kernel = system.Kernel();
     auto& process = GetCurrentProcess(kernel);
@@ -2541,6 +2637,11 @@ void Call(Core::System& system, u32 imm) {
             LOG_INFO(Kernel_SVC, "svc 0x18 t{} waits on{}", GetCurrentThread(kernel).GetThreadId(), list);
         }
     }
+    const bool wait_log = WaitLogEnabled() && IsWaitSvc(imm);
+    const auto wait_args = args;
+    const u64 wait_thread = wait_log ? GetCurrentThread(kernel).GetThreadId() : 0;
+    const auto wait_start = wait_log ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
     if (imm == 0x80) {
         // Switch 2 only: svcSetGpuMemoryAttribute(address, size, mask, attr). nn::gpu::sdk and
         // nn::gs native memory set the new "GPU accessible" attribute (0x20) before registering
@@ -2573,6 +2674,13 @@ void Call(Core::System& system, u32 imm) {
         Call64(system, imm, args);
     } else {
         Call32(system, imm, args);
+    }
+    if (wait_log) {
+        const u64 elapsed = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 std::chrono::steady_clock::now() - wait_start)
+                                                 .count());
+        RecordWait(kernel, process, wait_thread, imm, wait_args,
+                   static_cast<u32>(GetArg64(args, 0)), elapsed);
     }
     if (svc_trace) {
         LOG_INFO(Kernel_SVC, "svc {:#04x} out t{} [0]={:#x} [1]={:#x} [2]={:#x}", imm,
