@@ -161,10 +161,10 @@ android {
                 "proguard-rules.pro"
             )
 
-            manifestPlaceholders += mapOf("appNameSuffix" to " Debug Release")
+            manifestPlaceholders += mapOf("appNameSuffix" to "")
 
             versionNameSuffix = "-relWithDebInfo"
-            applicationIdSuffix = ".relWithDebInfo"
+            applicationIdSuffix = ".lichii"
             isJniDebuggable = true
         }
 
@@ -190,8 +190,8 @@ android {
             isDefault = true
             minSdk = 33
 
-            manifestPlaceholders += mapOf("appNameBase" to "Eden")
-            resValue("string", "app_name_suffixed", "Eden")
+            manifestPlaceholders += mapOf("appNameBase" to "Lichii")
+            resValue("string", "app_name_suffixed", "Lichii")
 
             ndk {
                 abiFilters += listOf("arm64-v8a")
@@ -265,12 +265,12 @@ android {
     }
 
     productFlavors.all {
-        val currentName = manifestPlaceholders["appNameBase"] as? String ?: "Eden"
+        val currentName = manifestPlaceholders["appNameBase"] as? String ?: "Lichii"
         val suffix = if (isNightly) " Nightly" else ""
 
         // apply nightly suffix I/A
         resValue("string", "app_name_suffixed", "$currentName$suffix")
-        resValue("string", "app_name", "Eden$suffix")
+        resValue("string", "app_name", "Lichii$suffix")
     }
 
     sourceSets {
