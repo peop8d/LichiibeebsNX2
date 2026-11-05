@@ -13,6 +13,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <atomic>
 #include <chrono>
 #include <algorithm>
 #include <cstdlib>
@@ -264,8 +265,33 @@ void CountRequest(const std::string& service, u32 command, u32 type, u32 result)
 
 Result ServiceFrameworkBase::HandleSyncRequest(Kernel::KServerSession& session,
                                                HLERequestContext& ctx) {
+    // Android diagnostic (EDEN_NX2_SLOW_IPC elsewhere): log service calls that take 40 ms or
+    // more, split into the time spent waiting for the service lock and in the handler.
+#ifdef __ANDROID__
+    static constexpr bool slow_ipc_log = true;
+#else
+    static const bool slow_ipc_log = std::getenv("EDEN_NX2_SLOW_IPC") != nullptr;
+#endif
+    const auto slow_ipc_entered = std::chrono::steady_clock::now();
     const auto guard = LockService();
+    const auto slow_ipc_locked = std::chrono::steady_clock::now();
     SCOPE_EXIT {
+        if (slow_ipc_log) {
+            const auto slow_ipc_done = std::chrono::steady_clock::now();
+            const double lock_ms =
+                std::chrono::duration<double, std::milli>(slow_ipc_locked - slow_ipc_entered)
+                    .count();
+            const double handler_ms =
+                std::chrono::duration<double, std::milli>(slow_ipc_done - slow_ipc_locked)
+                    .count();
+            static std::atomic<u32> slow_ipc_logged{0};
+            if (lock_ms + handler_ms >= 40.0 &&
+                slow_ipc_logged.fetch_add(1, std::memory_order_relaxed) < 3000) {
+                LOG_INFO(Service, "SLOWIPC {} cmd {} type {}: lock {:.1f} ms, handler {:.1f} ms",
+                         service_name, ctx.GetCommand(), static_cast<u32>(ctx.GetCommandType()),
+                         lock_ms, handler_ms);
+            }
+        }
         const auto* cmd_buf = ctx.CommandBuffer();
         u32 result_word = 0;
         const u32 type = static_cast<u32>(ctx.GetCommandType());
