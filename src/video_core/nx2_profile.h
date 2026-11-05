@@ -71,7 +71,11 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
 };
 
 // Read once at startup: Enabled() runs several times per method write (no guard to check).
-inline const bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+   #ifdef __ANDROID__
+   inline const bool g_enabled = true;
+   #else
+   inline const bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+   #endif
 
 inline bool Enabled() {
     return g_enabled;
