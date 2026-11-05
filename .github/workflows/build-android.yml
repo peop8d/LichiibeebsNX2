@@ -17,6 +17,13 @@ jobs:
     timeout-minutes: 300
     env:
       NUM_JOBS: 4
+      # Compiler cache: rebuilds only recompile files that changed since the last run.
+      CCACHE: "true"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_MAXSIZE: 3G
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime
     steps:
       - name: Free disk space
         run: |
@@ -46,12 +53,49 @@ jobs:
           echo "ANDROID_NDK_ROOT=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
 
       - name: Install host tools
-        run: sudo apt-get update && sudo apt-get install -y ninja-build glslang-tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build glslang-tools ccache
+
+      # Make ninja keep compiling after an error, so one run reports every broken file.
+      - name: Keep going on compile errors
+        run: |
+          N="$ANDROID_SDK_ROOT/cmake/3.31.5/bin/ninja"
+          mv "$N" "$N.real"
+          printf '#!/bin/sh\nexec "%s.real" -k 0 "$@"\n' "$N" > "$N"
+          chmod +x "$N"
+
+      # Restore the compiler, Gradle and dependency caches of the most recent run.
+      - name: Restore build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .ccache
+            .cache/cpm
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: android-build-${{ inputs.build_type }}-${{ github.run_id }}
+          restore-keys: |
+            android-build-${{ inputs.build_type }}-
 
       - name: Build APK
         run: |
           chmod +x .ci/android/build.sh
           .ci/android/build.sh -t standard -b "${{ inputs.build_type }}"
+
+      - name: Cache statistics
+        if: always()
+        run: ccache -s || true
+
+      # Saved even when the build fails, so the next attempt reuses everything already compiled.
+      - name: Save build cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .ccache
+            .cache/cpm
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: android-build-${{ inputs.build_type }}-${{ github.run_id }}
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
