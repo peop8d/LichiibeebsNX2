@@ -16,6 +16,12 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#if defined(__linux__) || defined(__ANDROID__)
+#include <dirent.h>
+#include <unistd.h>
+#include <fstream>
+#include <sstream>
+#endif
 
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
@@ -2535,6 +2541,74 @@ bool IsWaitSvc(u32 imm) {
     }
 }
 
+// Host threads of this process: CPU time used per second and the CPU each one last ran on
+// (the Thor has slow Cortex-A510 cores, so an emulated core stuck on one shows up here).
+void LogHostThreads(double window_s) {
+#if defined(__linux__) || defined(__ANDROID__)
+    struct Sample {
+        std::string name;
+        u64 ticks{};
+        int cpu{-1};
+    };
+    static std::map<int, u64> previous;
+    std::map<int, Sample> current;
+    DIR* dir = opendir("/proc/self/task");
+    if (dir == nullptr) {
+        return;
+    }
+    while (const dirent* entry = readdir(dir)) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+        const int tid = std::atoi(entry->d_name);
+        std::ifstream stat_file(fmt::format("/proc/self/task/{}/stat", tid));
+        std::string text;
+        std::getline(stat_file, text);
+        const auto open_paren = text.find('(');
+        const auto close_paren = text.rfind(')');
+        if (open_paren == std::string::npos || close_paren == std::string::npos) {
+            continue;
+        }
+        Sample sample;
+        sample.name = text.substr(open_paren + 1, close_paren - open_paren - 1);
+        std::istringstream fields(text.substr(close_paren + 2));
+        std::vector<std::string> values;
+        for (std::string value; fields >> value;) {
+            values.push_back(value);
+        }
+        // values[0] is field 3 (state): utime is field 14, stime 15, processor 39.
+        if (values.size() < 37) {
+            continue;
+        }
+        sample.ticks = std::stoull(values[11]) + std::stoull(values[12]);
+        sample.cpu = std::atoi(values[36].c_str());
+        current[tid] = std::move(sample);
+    }
+    closedir(dir);
+    const double ticks_per_s = static_cast<double>(sysconf(_SC_CLK_TCK));
+    std::vector<std::tuple<double, int, std::string, int>> busy;
+    for (const auto& [tid, sample] : current) {
+        const auto it = previous.find(tid);
+        const u64 before = it == previous.end() ? sample.ticks : it->second;
+        const double ms_per_s =
+            static_cast<double>(sample.ticks - before) * 1000.0 / ticks_per_s / window_s;
+        busy.emplace_back(ms_per_s, tid, sample.name, sample.cpu);
+    }
+    previous.clear();
+    for (const auto& [tid, sample] : current) {
+        previous[tid] = sample.ticks;
+    }
+    std::sort(busy.begin(), busy.end(),
+              [](const auto& a, const auto& b) { return std::get<0>(a) > std::get<0>(b); });
+    for (size_t i = 0; i < std::min<size_t>(busy.size(), 15); ++i) {
+        LOG_INFO(Kernel_SVC, "HOSTCPU {:>6.1f} ms/s cpu{} tid {} {}", std::get<0>(busy[i]),
+                 std::get<3>(busy[i]), std::get<1>(busy[i]), std::get<2>(busy[i]));
+    }
+#else
+    (void)window_s;
+#endif
+}
+
 struct WaitStat {
     u64 count{};
     u64 total_ns{};
@@ -2591,6 +2665,7 @@ void RecordWait(Kernel::KernelCore& kernel, Kernel::KProcess& process, u64 threa
                  entry.count, static_cast<double>(entry.total_ns) / 1e6 / window_s,
                  static_cast<double>(entry.max_ns) / 1e6, entry.detail);
     }
+    LogHostThreads(window_s);
     stats.clear();
     window_start = now;
 }
