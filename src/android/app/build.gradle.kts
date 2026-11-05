@@ -405,6 +405,13 @@ afterEvaluate {
         val apkFile = outputsDir.file("apk/$flavor/$type/$baseName.apk")
         val aabFile = outputsDir.file("bundle/$variantName/$baseName.aab")
 
+        // Kotlin needs the SDL Java sources that the CMake configure step copies into
+        // externals/generated/sdl, so never compile Kotlin before CMake has configured.
+        val cmakeType = type.replaceFirstChar { it.uppercaseChar() }
+        tasks.matching { it.name == "compile${variantTask}Kotlin" }.configureEach {
+            dependsOn(tasks.matching { it.name.startsWith("configureCMake${cmakeType}[") })
+        }
+
         val taskName = "copy${variantTask}Outputs"
 
         tasks.register<Copy>(taskName) {
